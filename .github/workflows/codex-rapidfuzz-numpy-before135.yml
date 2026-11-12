@@ -1,0 +1,287 @@
+name: new135 untouched RapidFuzz NumPy baseline
+on:
+  push:
+    branches: [codex/observe-rapidfuzz-numpy135]
+    paths: [.github/workflows/codex-rapidfuzz-numpy-before135.yml]
+permissions:
+  contents: read
+jobs:
+  observe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      PIP_NO_CACHE_DIR: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout whole original RapidFuzz source and pinned submodules
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: rapidfuzz/RapidFuzz
+          ref: e5ba5955a0979bd316e31972f657dec976774492
+          submodules: recursive
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Set up fixed Python without cache
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12.12'
+      - name: Stage external recipes and record original source
+        shell: bash
+        run: |
+          set -euo pipefail
+          export NEW135_EVIDENCE="$RUNNER_TEMP/new135-evidence"
+          mkdir -p "$NEW135_EVIDENCE"
+          echo "NEW135_EVIDENCE=$NEW135_EVIDENCE" >> "$GITHUB_ENV"
+          cat > "$NEW135_EVIDENCE/probe135.py" <<'NEW135_PROBE135_PY'
+          """Public API observation only; no source mutation or backend monkeypatching."""
+          import hashlib
+          import importlib.metadata
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          
+          import numpy as np
+          import rapidfuzz
+          from rapidfuzz import fuzz, process
+          from rapidfuzz.distance import Jaro, JaroWinkler, LCSseq, Levenshtein
+          
+          HASHES = {
+              "distance/Jaro_py.py": "ca9862e8e629626ccf394843560f012d3b6d6d12e9b2183ea5dfe50be96d5be9",
+              "distance/LCSseq_py.py": "3746caa3522641dc4ded3a1263fab29d9e365cad31bc61687fa139a540d3b1e6",
+              "fuzz_py.py": "476a504ef492f2217ff5c76b48b59a62cdb7cc52c9429111c4e897eef403284d",
+          }
+          package = Path(rapidfuzz.__file__).resolve().parent
+          assert package.is_relative_to(Path(sys.prefix).resolve()), package
+          actual_hashes = {p: hashlib.sha256((package / p).read_bytes()).hexdigest() for p in HASHES}
+          assert actual_hashes == HASHES, actual_hashes
+          implementation = os.environ["RAPIDFUZZ_IMPLEMENTATION"]
+          if implementation == "cpp":
+              assert "metrics_cpp" in Jaro.similarity.__module__, Jaro.similarity.__module__
+          else:
+              assert implementation == "python" and Jaro.similarity.__module__ == "rapidfuzz.distance.Jaro_py"
+          print("NEW135_META " + json.dumps({
+              "implementation": implementation, "python": sys.version.split()[0],
+              "numpy": np.__version__, "rapidfuzz": rapidfuzz.__version__,
+              "package": str(package), "jaro_module": Jaro.similarity.__module__,
+              "source_hashes": actual_hashes,
+              "probe_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+              "direct_url": json.loads(importlib.metadata.distribution("RapidFuzz").read_text("direct_url.json")),
+          }), flush=True)
+          records = []
+          
+          
+          def observe(case, action, oracle):
+              try:
+                  actual = np.asarray(action()).tolist()
+                  contract = bool(np.allclose(actual, oracle, rtol=1e-7, atol=1e-7))
+                  result = dict(case=case, oracle=oracle, actual=actual, error=None, contract=contract)
+              except Exception as error:
+                  result = dict(case=case, oracle=oracle, actual=None,
+                                error={"type": type(error).__name__, "message": str(error)}, contract=False)
+              records.append(result)
+              print("NEW135_CASE " + json.dumps(result, allow_nan=False), flush=True)
+          
+          
+          first, second = [65, 66, 67, 68], [65, 66, 67, 69]
+          algorithms = [
+              ("Jaro.similarity", Jaro.similarity, 5 / 6),
+              ("Jaro.normalized_similarity", Jaro.normalized_similarity, 5 / 6),
+              ("Jaro.distance", Jaro.distance, 1 / 6),
+              ("Jaro.normalized_distance", Jaro.normalized_distance, 1 / 6),
+              ("LCSseq.normalized_distance", LCSseq.normalized_distance, 1 / 4),
+              ("LCSseq.normalized_similarity", LCSseq.normalized_similarity, 3 / 4),
+              ("QRatio", fuzz.QRatio, 75),
+          ]
+          for label, convert in [
+              ("list", list), ("tuple", tuple),
+              ("ndarray", lambda x: np.asarray(x, dtype=np.int64)),
+              ("strided", lambda x: np.repeat(np.asarray(x, dtype=np.int64), 2)[::2]),
+          ]:
+              a, b = convert(first), convert(second)
+              for name, method, oracle in algorithms:
+                  observe(label + ":" + name, lambda m=method, a=a, b=b: m(a, b), oracle)
+          
+          array = np.array(first, dtype=np.int64)
+          for name, method in [("partial_ratio", fuzz.partial_ratio), ("QRatio", fuzz.QRatio), ("WRatio", fuzz.WRatio)]:
+              observe("identical-array:" + name, lambda m=method: m(array, array), 100)
+              observe("identical-list:" + name, lambda m=method: m(first, first), 100)
+          observe("QRatio:zero-array", lambda: fuzz.QRatio(np.array([0]), np.array([0])), 100)
+          observe("QRatio:zero-list", lambda: fuzz.QRatio([0], [0]), 100)
+          observe("processor:Jaro", lambda: Jaro.similarity("ABCD", "ABCE", processor=lambda x: np.array(list(map(ord, x)))), 5 / 6)
+          
+          
+          def best_match():
+              match = process.extractOne(array, [np.array([70, 71, 72, 73]), np.array(second)], scorer=Jaro.similarity)
+              assert match is not None and match[2] == 1, match
+              return match[1]
+          
+          
+          observe("extractOne:Jaro", best_match, 5 / 6)
+          rows = np.array([first, second], dtype=np.int64)
+          observe("cdist:Jaro", lambda: process.cdist(rows, rows, scorer=Jaro.similarity), [[1, 5 / 6], [5 / 6, 1]])
+          observe("control:Levenshtein", lambda: Levenshtein.distance(np.array(first), np.array(second)), 1)
+          observe("control:JaroWinkler", lambda: JaroWinkler.similarity(np.array(first), np.array(first)), 1)
+          observe("control:Jaro-empty", lambda: Jaro.similarity([], []), 1)
+          observe("control:LCS-empty", lambda: LCSseq.normalized_distance([], first), 1)
+          observe("control:QRatio-empty", lambda: fuzz.QRatio([], []), 0)
+          failed = [r["case"] for r in records if not r["contract"]]
+          print("NEW135_SUMMARY " + json.dumps({"case_count": len(records), "failed_cases": failed}), flush=True)
+          raise SystemExit(1 if failed else 0)
+          NEW135_PROBE135_PY
+          cat > "$NEW135_EVIDENCE/snapshot135.py" <<'NEW135_SNAPSHOT135_PY'
+          """Record pinned tracked source and external diagnostic script bytes only."""
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          
+          root = Path(os.environ["GITHUB_WORKSPACE"])
+          evidence = Path(os.environ["NEW135_EVIDENCE"])
+          
+          
+          def git(*args):
+              return subprocess.check_output(["git", "-C", str(root), *args])
+          
+          
+          assert git("rev-parse", "HEAD").decode().strip() == "e5ba5955a0979bd316e31972f657dec976774492"
+          assert git("rev-parse", "HEAD^{tree}").decode().strip() == "b9d0d811d9b998b3f4689a358b13592677441547"
+          status = git("status", "--porcelain", "--untracked-files=no").decode()
+          assert status == "", status
+          git("diff", "--exit-code", "HEAD")
+          git("submodule", "foreach", "--quiet", "--recursive", "git diff --exit-code HEAD")
+          paths = git("ls-files", "--recurse-submodules", "-z").split(b"\0")
+          tracked = {os.fsdecode(p): hashlib.sha256((root / os.fsdecode(p)).read_bytes()).hexdigest() for p in paths if p}
+          scripts = {name: hashlib.sha256((evidence / name).read_bytes()).hexdigest()
+                     for name in ["probe135.py", "snapshot135.py", "assess135.py"]}
+          record = {"head": git("rev-parse", "HEAD").decode().strip(),
+                    "tree": git("rev-parse", "HEAD^{tree}").decode().strip(),
+                    "tracked_status": status, "tracked": tracked, "scripts": scripts}
+          stage = sys.argv[1]
+          if stage != "original":
+              assert record == json.loads((evidence / "source-original.json").read_text()), "source/probe bytes changed"
+          (evidence / ("source-" + stage + ".json")).write_text(json.dumps(record, sort_keys=True))
+          print("NEW135_SOURCE " + json.dumps({"stage": stage, "head": record["head"], "tree": record["tree"],
+              "tracked_count": len(tracked), "tracked_status": status, "scripts": scripts,
+              "tracked_sha256": hashlib.sha256(json.dumps(tracked, sort_keys=True).encode()).hexdigest(),
+              "unchanged": True}), flush=True)
+          NEW135_SNAPSHOT135_PY
+          cat > "$NEW135_EVIDENCE/assess135.py" <<'NEW135_ASSESS135_PY'
+          """Strictly assess fixed baseline expectations; success is diagnostic only."""
+          import json
+          import math
+          import os
+          from pathlib import Path
+          
+          evidence = Path(os.environ["NEW135_EVIDENCE"])
+          source = json.loads((evidence / "source-original.json").read_text())
+          algorithm_oracles = {
+              "Jaro.similarity": 5 / 6, "Jaro.normalized_similarity": 5 / 6,
+              "Jaro.distance": 1 / 6, "Jaro.normalized_distance": 1 / 6,
+              "LCSseq.normalized_distance": 1 / 4, "LCSseq.normalized_similarity": 3 / 4, "QRatio": 75,
+          }
+          oracles = {container + ":" + name: oracle
+                     for container in ["list", "tuple", "ndarray", "strided"]
+                     for name, oracle in algorithm_oracles.items()}
+          oracles.update({container + ":" + name: 100
+                          for container in ["identical-array", "identical-list"]
+                          for name in ["partial_ratio", "QRatio", "WRatio"]})
+          oracles.update({"QRatio:zero-array": 100, "QRatio:zero-list": 100, "processor:Jaro": 5 / 6,
+                         "extractOne:Jaro": 5 / 6, "cdist:Jaro": [[1, 5 / 6], [5 / 6, 1]],
+                         "control:Levenshtein": 1, "control:JaroWinkler": 1,
+                         "control:Jaro-empty": 1, "control:LCS-empty": 1, "control:QRatio-empty": 0})
+          assert len(oracles) == 44
+          array_errors = {container + ":" + name for container in ["ndarray", "strided"] for name in algorithm_oracles}
+          array_errors.update({"identical-array:partial_ratio", "identical-array:QRatio", "identical-array:WRatio",
+                               "processor:Jaro", "extractOne:Jaro", "cdist:Jaro"})
+          assert len(array_errors) == 20
+          expected_hashes = {
+              "distance/Jaro_py.py": "ca9862e8e629626ccf394843560f012d3b6d6d12e9b2183ea5dfe50be96d5be9",
+              "distance/LCSseq_py.py": "3746caa3522641dc4ded3a1263fab29d9e365cad31bc61687fa139a540d3b1e6",
+              "fuzz_py.py": "476a504ef492f2217ff5c76b48b59a62cdb7cc52c9429111c4e897eef403284d",
+          }
+          
+          
+          def close(actual, expected):
+              if isinstance(expected, list):
+                  return isinstance(actual, list) and len(actual) == len(expected) and all(close(a, e) for a, e in zip(actual, expected))
+              return isinstance(actual, (int, float)) and not isinstance(actual, bool) and math.isclose(actual, expected, rel_tol=1e-7, abs_tol=1e-7)
+          
+          
+          for implementation, expected_status in [("cpp", "0"), ("python", "1")]:
+              status = (evidence / (implementation + ".status")).read_text().strip()
+              assert status == expected_status, (implementation, "unexpected process status", status)
+              lines = (evidence / (implementation + ".jsonl")).read_text().splitlines()
+              assert all(line.startswith(("NEW135_META ", "NEW135_CASE ", "NEW135_SUMMARY ")) for line in lines), lines
+              metadata = [json.loads(line.removeprefix("NEW135_META ")) for line in lines if line.startswith("NEW135_META ")]
+              records = [json.loads(line.removeprefix("NEW135_CASE ")) for line in lines if line.startswith("NEW135_CASE ")]
+              summaries = [json.loads(line.removeprefix("NEW135_SUMMARY ")) for line in lines if line.startswith("NEW135_SUMMARY ")]
+              assert len(metadata) == len(summaries) == 1
+              meta = metadata[0]
+              assert meta["implementation"] == implementation and meta["python"] == "3.12.12" and meta["numpy"] == "2.2.6", meta
+              assert meta["source_hashes"] == expected_hashes and meta["probe_sha256"] == source["scripts"]["probe135.py"], meta
+              assert meta["direct_url"]["url"] == Path(os.environ["GITHUB_WORKSPACE"]).as_uri(), meta["direct_url"]
+              assert ("metrics_cpp" in meta["jaro_module"]) if implementation == "cpp" else (meta["jaro_module"] == "rapidfuzz.distance.Jaro_py")
+              assert len(records) == len(oracles) and {r["case"] for r in records} == set(oracles)
+              observed_failures = set()
+              for record in records:
+                  case = record["case"]
+                  assert record["oracle"] == oracles[case], record
+                  if implementation == "python" and case in array_errors:
+                      assert record["error"] == {"type": "ValueError", "message": "The truth value of an array with more than one element is ambiguous. Use a.any() or a.all()"}, record
+                      assert record["actual"] is None and record["contract"] is False, record
+                  elif implementation == "python" and case == "QRatio:zero-array":
+                      assert record["error"] is None and record["actual"] == 0 and record["contract"] is False, record
+                  else:
+                      assert record["error"] is None and close(record["actual"], oracles[case]) and record["contract"] is True, record
+                  if not record["contract"]:
+                      observed_failures.add(case)
+              expected_failures = array_errors | {"QRatio:zero-array"} if implementation == "python" else set()
+              assert observed_failures == expected_failures
+              assert summaries[0]["case_count"] == 44 and len(summaries[0]["failed_cases"]) == len(expected_failures)
+              assert set(summaries[0]["failed_cases"]) == expected_failures
+              print("NEW135_ASSESS " + json.dumps({"implementation": implementation, "process_status": status,
+                  "cases": 44, "contract_passes": 44 - len(expected_failures), "contract_failures": len(expected_failures),
+                  "expected_baseline_signature_only": True, "product_fixed": False}), flush=True)
+          NEW135_ASSESS135_PY
+          python "$NEW135_EVIDENCE/snapshot135.py" original
+      - name: Install NumPy and unchanged whole project through normal PEP 517
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/new135-venv"
+          echo "$RUNNER_TEMP/new135-venv/bin" >> "$GITHUB_PATH"
+          export PATH="$RUNNER_TEMP/new135-venv/bin:$PATH"
+          python -m pip install --no-cache-dir numpy==2.2.6
+          RAPIDFUZZ_BUILD_EXTENSION=1 python -m pip install --no-cache-dir .
+          python "$NEW135_EVIDENCE/snapshot135.py" installed
+      - name: Observe required C++ control and capture raw process status
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          status=0
+          env -u PYTHONPATH RAPIDFUZZ_IMPLEMENTATION=cpp python "$NEW135_EVIDENCE/probe135.py" > "$NEW135_EVIDENCE/cpp.jsonl" 2>&1 || status=$?
+          printf '%s\n' "$status" > "$NEW135_EVIDENCE/cpp.status"
+          cat "$NEW135_EVIDENCE/cpp.jsonl"
+          echo "NEW135_PROCESS cpp $status"
+          python "$NEW135_EVIDENCE/snapshot135.py" cpp
+      - name: Observe identical public probe in Python fallback and capture raw status
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          status=0
+          env -u PYTHONPATH RAPIDFUZZ_IMPLEMENTATION=python python "$NEW135_EVIDENCE/probe135.py" > "$NEW135_EVIDENCE/python.jsonl" 2>&1 || status=$?
+          printf '%s\n' "$status" > "$NEW135_EVIDENCE/python.status"
+          cat "$NEW135_EVIDENCE/python.jsonl"
+          echo "NEW135_PROCESS python $status"
+      - name: Verify unchanged source and assess expected baseline signature only
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python "$NEW135_EVIDENCE/snapshot135.py" python
+          python "$NEW135_EVIDENCE/assess135.py"
